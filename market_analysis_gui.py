@@ -1,216 +1,217 @@
-import streamlit as st
-import pandas as pd
-from datetime import datetime
-from Analysisxls_combined import fetch_market_data, generate_entry_suggestion, backtest_signals, calculate_signal_accuracy, fetch_news_links
-from streamlit_autorefresh import st_autorefresh
-import streamlit.components.v1 as components
+import matplotlib
+matplotlib.use('Agg')
+
 import yfinance as yf
-import feedparser
-import joblib
+import requests
 import numpy as np
-import os
-from ta.volatility import AverageTrueRange
+import pandas as pd
+import matplotlib.pyplot as plt
+import mplfinance as mpf
+import io
+import ta
+from datetime import datetime, timedelta
 
-st.set_page_config(page_title="📈 Market Dashboard Pro", layout="wide")
-st.title("📈 Market Analysis Dashboard By DroneQuad")
-# # st_autorefresh(interval=5000, key="refresh_counter")  # Disabled to avoid page flicker  # Disabled full page refresh
-
-if not os.path.exists("ai_signal_booster_model.pkl"):
-    st.error("Model AI tidak ditemukan.")
-    st.stop()
-
-@st.cache_resource
-def load_ai_model():
-    return joblib.load("ai_signal_booster_model.pkl")
-
-ai_model = load_ai_model()
-
-@st.cache_data(ttl=5)
-def load_price_data(ticker, tf):
-    try:
-        data = yf.Ticker(ticker).history(period='7d', interval=tf)
-        if data.empty:
-            data = yf.Ticker(ticker).history(period='7d', interval='1h')
-        return data
-    except:
-        return pd.DataFrame()
-
-def fetch_news_feed(symbol):
-    try:
-        feed = feedparser.parse(f'https://news.google.com/rss/search?q={symbol}')
-        return feed.entries[:3]
-    except:
-        return []
-
-def render_heatmap_box(symbol, bias):
-    color = {"Bullish": "#4CAF50", "Bearish": "#F44336"}.get(bias, "#9E9E9E")
-    return f"<div style='background-color:{color};padding:5px;margin:2px;border-radius:5px;color:white'>{symbol}: {bias}</div>"
-
-def get_tradingview_symbol(symbol):
-    mapping = {
-        "BTCUSD": "BINANCE:BTCUSDT",
-        "ETHUSD": "BINANCE:ETHUSDT",
-        "XAUUSD": "TVC:GOLD",
-        "USOIL": "TVC:USOIL",
-        "USTEC": "NASDAQ:NDX"
+def fetch_market_data():
+    symbol_map = {
+        "BTCUSD": {"ticker": "BTC-USD", "type": "crypto"},
+        "ETHUSD": {"ticker": "ETH-USD", "type": "crypto"},
+        "XAUUSD": {"ticker": "GC=F", "type": "commodity"},
+        "USOIL": {"ticker": "CL=F", "type": "commodity"},
+        "USTEC": {"ticker": "^NDX", "type": "index"},
     }
-    return mapping.get(symbol, f"BINANCE:{symbol}")
+    assets = []
+    for symbol, info in symbol_map.items():
+        price = get_price(info["ticker"])
+        if price is None:
+            continue
+        levels = get_technical_levels(info["ticker"], price)
+        bias = levels["bias"]
+        assets.append({
+            "symbol": symbol,
+            "price": price,
+            "bias": bias,
+            "support": levels["support"],
+            "resistance": levels["resistance"],
+            "volatility": levels["volatility"],
+            "fallback_used": False
+        })
+    return assets, []
 
-def generate_ai_features(df):
-    df['return'] = df['Close'].pct_change()
-    df['EMA5'] = df['Close'].ewm(span=5).mean()
-    df['EMA20'] = df['Close'].ewm(span=20).mean()
-    df['EMA_diff'] = df['EMA5'] - df['EMA20']
-    df['RSI'] = 100 - (100 / (1 + df['return'].rolling(14).mean() / df['return'].rolling(14).std()))
-    df.dropna(inplace=True)
-    return df[['return', 'EMA_diff', 'RSI']]
-
-assets_data, _ = fetch_market_data()
-df = pd.DataFrame(assets_data)
-
-symbol_map = {
-    "BTCUSD": "BTC-USD",
-    "ETHUSD": "ETH-USD",
-    "XAUUSD": "GC=F",
-    "USOIL": "CL=F",
-    "USTEC": "^NDX"
-}
-
-filter_signal = st.checkbox("🔎 Tampilkan hanya simbol dengan sinyal entry (BUY/SELL)")
-active_signals = {}
-
-for symbol, ticker in symbol_map.items():
+def get_price(ticker):
     try:
-        data = load_price_data(ticker, '1h')
-        bt = backtest_signals(data)
-        if bt['Signal'].iloc[-1] != 0:
-            active_signals[symbol] = "BUY" if bt['Signal'].iloc[-1] == 1 else "SELL"
+        data = yf.Ticker(ticker).history(period="1d", interval="15m")
+        return round(data["Close"].iloc[-1], 2)
     except:
-        continue
+        return None
 
-if filter_signal:
-    symbol_map = {s: t for s, t in symbol_map.items() if s in active_signals}
+def get_technical_levels(ticker, price):
+    try:
+        data = yf.Ticker(ticker).history(period="7d", interval="1h")
+        short_ma = data["Close"].tail(5).mean()
+        long_ma = data["Close"].mean()
+        bias = "Bullish" if short_ma > long_ma else "Bearish"
+        vol = data["Close"].pct_change().std() * 100
+        return {
+            "bias": bias,
+            "support": round(price * 0.95, 2),
+            "resistance": round(price * 1.05, 2),
+            "volatility": f"{vol:.2f}%" if not np.isnan(vol) else "N/A"
+        }
+    except:
+        return {
+            "bias": "Neutral",
+            "support": price * 0.95,
+            "resistance": price * 1.05,
+            "volatility": "N/A"
+        }
 
-tabs = st.tabs(list(symbol_map.keys()))
-for i, (symbol, ticker) in enumerate(symbol_map.items()):
-    with tabs[i]:
-        st.header(f"📌 {symbol}")
-        tf = st.selectbox("🕒 Pilih timeframe:", ["5m", "15m", "1h", "4h", "1d"], key=symbol)
+def generate_comment(symbol, bias):
+    if bias == "Bullish":
+        return f"{symbol}: Potensi breakout, tren menguat."
+    elif bias == "Bearish":
+        return f"{symbol}: Waspadai koreksi, tren melemah."
+    return f"{symbol}: Perlu konfirmasi lebih lanjut."
 
-        col1, col2 = st.columns([3, 1])
-        with col1:
-            tf_map = {"5m": "5", "15m": "15", "1h": "60", "4h": "240", "1d": "D"}
-            interval_code = tf_map.get(tf, "60")
-            tvsymbol = get_tradingview_symbol(symbol)
-            st.markdown("### 📈 Chart Interaktif TradingView (Candlestick)")
-            components.html(f'''<iframe src="https://www.tradingview.com/widgetembed/?symbol={tvsymbol}&interval={interval_code}&theme=dark&style=1" width="100%" height="500" frameborder="0"></iframe>''', height=520)
+def generate_short_report(assets_data):
+    now = pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S')
+    text = f"📈 *MARKET ANALYSIS REPORT*\n*Updated: {now}*\n\n"
+    for a in assets_data:
+        text += f"- {a['symbol']}: ${a['price']:,} {a['bias']}\n"
+        text += f"  📌 {generate_comment(a['symbol'], a['bias'])}\n"
+    return text
 
-            st.markdown(f"### 📊 Analisa Lengkap {symbol}")
-            try:
-                row = df[df['symbol'] == symbol].iloc[0]
-                st.markdown(f"""
-- **Harga**: ${row['price']}
-- **Bias**: {row['bias']}
-- **Support**: {row['support']}
-- **Resistance**: {row['resistance']}
-- **Volatilitas**: {row['volatility']}
-                """)
-            except:
-                st.warning("Data tidak tersedia untuk analisa lengkap.")
+def generate_chart_with_ema(ticker, symbol, timeframe='15m'):
+    try:
+        data = yf.Ticker(ticker).history(period='7d', interval=timeframe)
+        if data.empty:
+            return None
+        data['EMA5'] = data['Close'].ewm(span=5).mean()
+        data['EMA20'] = data['Close'].ewm(span=20).mean()
+        apds = [
+            mpf.make_addplot(data['EMA5'], color='lime'),
+            mpf.make_addplot(data['EMA20'], color='orange')
+        ]
+        fig, ax = mpf.plot(
+            data,
+            type='candle',
+            addplot=apds,
+            returnfig=True,
+            title=f"{symbol} {timeframe} Chart",
+            style='yahoo',
+            volume=False
+        )
+        buf = io.BytesIO()
+        plt.savefig(buf, format='png')
+        buf.seek(0)
+        plt.close(fig)
+        return buf
+    except:
+        return None
 
-            st.markdown("### 🤖 Prediksi AI & Confidence (Arah & Volatilitas)")
-            try:
-                df_price = load_price_data(ticker, '1h')
-                features = generate_ai_features(df_price)
-                latest_features = features.iloc[-1:]
-                prob = ai_model.predict_proba(latest_features)[0]
-                direction = "⬆️ Naik" if prob[1] > 0.5 else "⬇️ Turun"
-                st.metric("Prediksi AI", direction, delta=f"Confidence: {prob[1]*100:.2f}%")
+def calculate_indicators(data):
+    if len(data) < 50:
+        return pd.DataFrame()
+    data['EMA5'] = data['Close'].ewm(span=5).mean()
+    data['EMA20'] = data['Close'].ewm(span=20).mean()
+    data['EMA50'] = data['Close'].ewm(span=50).mean()
+    data['SMA5'] = data['Close'].rolling(window=5).mean()
+    data['SMA20'] = data['Close'].rolling(window=20).mean()
+    data['SMA50'] = data['Close'].rolling(window=50).mean()
+    data['RSI'] = ta.momentum.RSIIndicator(close=data['Close'], window=14).rsi()
+    macd = ta.trend.MACD(close=data['Close'])
+    data['MACD'] = macd.macd()
+    data['MACD_signal'] = macd.macd_signal()
+    return data
 
-                vol_pred = features['return'].rolling(20).std().iloc[-1] * 100
-                st.caption(f"📉 Prediksi Volatilitas (1h): ±{vol_pred:.2f}%")
+def generate_entry_suggestion(data):
+    if data is None or len(data) < 50:
+        return "Data tidak cukup untuk memberikan saran."
 
-                bias = df[df['symbol'] == symbol]['bias'].values[0] if symbol in df['symbol'].values else ''
-                if (direction == "⬆️ Naik" and bias == "Bearish") or (direction == "⬇️ Turun" and bias == "Bullish"):
-                    st.warning("⚠️ AI dan analisa teknikal tidak selaras. Gunakan kehati-hatian.")
-            except Exception as e:
-                st.warning(f"Gagal memuat prediksi AI: {e}")
+    data = calculate_indicators(data)
+    latest = data.iloc[-1]
+    signals = []
+    recommendation = "🔍 Rekomendasi: Tunggu konfirmasi arah"
 
-            st.markdown("### 🔍 Saran Entry Otomatis")
-            try:
-                data = load_price_data(ticker, tf)
-                suggestion = generate_entry_suggestion(data)
-                st.markdown(suggestion if suggestion else "Tidak ada saran.")
-            except:
-                suggestion = ""
-                st.warning("Gagal memuat data untuk analisa sinyal.")
+    entry_price = None
+    stop_loss = None
+    take_profit = None
+    rrr_value = None
 
-            
-            st.markdown("### 🧠 Confidence Breakdown")
-            try:
-                if suggestion:
-                    with st.expander("📊 Rincian Indikator"):
-                        for line in suggestion.split('\n'):
-                            if any(x in line for x in ["📊", "📉", "📈", "🔼", "🔽"]):
-                                st.write("✅", line)
-                    conf_score = sum(suggestion.count(k) for k in ['📊', '📉', '📈', '🔼', '🔽'])
-                    total_signals = 6
-                    conf_ratio = min(conf_score / total_signals, 1.0)
-                    st.progress(conf_ratio)
-                    st.caption(f"Confidence Score: {conf_ratio*100:.1f}%")
-                else:
-                    st.caption("Confidence tidak tersedia")
-            except Exception as e:
-                st.caption(f"Confidence error: {e}")
-                st.caption(f"Confidence error: {e}")
+    try:
+        atr = ta.volatility.AverageTrueRange(
+            high=data['High'],
+            low=data['Low'],
+            close=data['Close'],
+            window=14
+        ).average_true_range().iloc[-1]
+    except:
+        atr = 0
 
-            st.markdown("### 🧪 Backtest Mini")
-            try:
-                backtest = backtest_signals(data)
-                signal_count = (backtest['Signal'] != 0).sum()
-                st.markdown(f"💡 Total sinyal historis terdeteksi: {signal_count}")
-                if signal_count >= 2:
-                    accuracy = calculate_signal_accuracy(data)
-                    st.success(f"🎯 Akurasi sinyal historis: {accuracy}%")
-                # st.line_chart(...) removed as requested for cleaner UI
-            except:
-                st.warning("Gagal backtest sinyal historis.")
+    if latest['EMA5'] > latest['EMA20'] > latest['EMA50']:
+        signals.append("📊 EMA trend naik (5>20>50)")
+        if latest['RSI'] < 70:
+            entry_price = round(latest['EMA20'], 2)
+            stop_loss = round(latest['Low'] - atr, 2)
+            take_profit = round(entry_price + 2 * (entry_price - stop_loss), 2)
+            recommendation = "✅ BUY on pullback ke EMA20"
+    elif latest['EMA5'] < latest['EMA20'] < latest['EMA50']:
+        signals.append("📊 EMA trend turun (5<20<50)")
+        if latest['RSI'] > 30:
+            entry_price = round(latest['EMA20'], 2)
+            stop_loss = round(latest['High'] + atr, 2)
+            take_profit = round(entry_price - 2 * (stop_loss - entry_price), 2)
+            recommendation = "⚠️ SELL on rebound ke EMA20"
 
-            st.markdown("### ⚖️ Risk Reward Ratio")
-            try:
-                if "RRR" in suggestion:
-                    rrr_line = [line for line in suggestion.split('\n') if "RRR" in line][0]
-                    st.success(rrr_line)
-                else:
-                    st.info("RRR tidak tersedia.")
-            except:
-                st.info("RRR tidak tersedia.")
+    if latest['RSI'] < 30:
+        signals.append("📉 RSI oversold → potensi Buy")
+    elif latest['RSI'] > 70:
+        signals.append("📈 RSI overbought → potensi Sell")
 
-            st.markdown("### 🧮 Evaluasi SL/TP Otomatis")
-            try:
-                atr = AverageTrueRange(data['High'], data['Low'], data['Close'], window=14).average_true_range().iloc[-1]
-                sl_range = atr * 0.5
-                tp_range = atr * 1.5
-                st.success(f"SL: ±{sl_range:.2f}, TP: ±{tp_range:.2f} (berdasarkan ATR14)")
-            except:
-                st.warning("Tidak dapat menghitung SL/TP otomatis.")
+    if latest['MACD'] > latest['MACD_signal']:
+        signals.append("🔼 MACD positif → momentum naik")
+    else:
+        signals.append("🔽 MACD negatif → momentum lemah")
 
-            st.markdown("### 🌐 Berita Global Terkait")
-            news_items = fetch_news_feed(symbol)
-            if news_items:
-                for n in news_items:
-                    st.markdown(f"**[{n.title}]({n.link})**")
-            else:
-                st.caption("Tidak ada berita ditemukan.")
+    if latest['SMA5'] > latest['SMA20'] > latest['SMA50']:
+        signals.append("📈 SMA menunjukkan tren naik stabil")
+    elif latest['SMA5'] < latest['SMA20'] < latest['SMA50']:
+        signals.append("📉 SMA menunjukkan tren turun stabil")
 
-        with col2:
-            st.markdown("### 🔥 Heatmap Sinyal")
-            for a in assets_data:
-                st.markdown(render_heatmap_box(a['symbol'], a['bias']), unsafe_allow_html=True)
+    if entry_price is not None and stop_loss is not None and take_profit is not None:
+        rrr_value = round((take_profit - entry_price) / (entry_price - stop_loss), 2)
 
-            st.markdown("### 📡 Sinyal Aktif")
-            if active_signals:
-                for s in active_signals:
-                    st.success(f"{s} → {active_signals[s]}")
-            else:
-                st.info("Tidak ada sinyal aktif.")
+    output = "\n".join(signals + [recommendation])
+    if entry_price is not None:
+        output += f"\n🎯 Entry: ${entry_price}"
+    if stop_loss is not None:
+        output += f"\n🛑 SL: ${stop_loss}"
+    if take_profit is not None:
+        output += f"\n🎯 TP: ${take_profit}"
+    if rrr_value is not None:
+        output += f"\n⚖️ RRR: {rrr_value}"
+
+    return output
+
+def backtest_signals(data):
+    data = calculate_indicators(data)
+    data['Signal'] = 0
+    data.loc[(data['EMA5'] > data['EMA20']) & (data['EMA20'] > data['EMA50']) & (data['RSI'] < 70), 'Signal'] = 1
+    data.loc[(data['EMA5'] < data['EMA20']) & (data['EMA20'] < data['EMA50']) & (data['RSI'] > 30), 'Signal'] = -1
+    return data[['Close', 'Signal']]
+
+def calculate_signal_accuracy(data):
+    bt = backtest_signals(data)
+    trades = bt[bt['Signal'] != 0].copy()
+    wins = 0
+    for i in range(len(trades) - 1):
+        entry_price = trades.iloc[i]['Close']
+        exit_price = trades.iloc[i + 1]['Close']
+        if trades.iloc[i]['Signal'] == 1 and exit_price > entry_price:
+            wins += 1
+        elif trades.iloc[i]['Signal'] == -1 and exit_price < entry_price:
+            wins += 1
+    accuracy = (wins / max(1, len(trades) - 1)) * 100
+    return round(accuracy, 2)
+
+def fetch_news_links(symbol):
+    return f"https://news.google.com/search?q={symbol}"
